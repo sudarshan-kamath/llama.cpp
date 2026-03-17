@@ -40,6 +40,8 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    int32_t moe_staging; // MoE expert staging buffer cap (0 = disabled)
+
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;

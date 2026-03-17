@@ -340,6 +340,14 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // MoE expert staging buffer
+    // When enabled (cap > 0), cross-backend MoE weight copies are allocated with ne[2] = cap
+    // instead of ne[2] = n_expert. At runtime, only the selected experts are packed contiguously
+    // into the staging buffer and the expert IDs are remapped to 0..n_unique-1.
+    // This reduces GPU VRAM usage for MoE models when experts are kept on CPU (--cpu-moe).
+    // cap should typically be set to n_expert_used (the top-k count).
+    GGML_API void                 ggml_backend_sched_set_moe_staging(ggml_backend_sched_t sched, int cap);
+
     //
     // Utils
     //

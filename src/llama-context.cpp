@@ -160,8 +160,9 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-    cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
+    cparams.op_offload   = params.op_offload;
+    cparams.kv_unified   = params.kv_unified;
+    cparams.moe_staging  = params.moe_staging;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -417,6 +418,11 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    if (cparams.moe_staging > 0) {
+        ggml_backend_sched_set_moe_staging(sched.get(), cparams.moe_staging);
+        LLAMA_LOG_INFO("%s: MoE expert staging enabled with cap = %d\n", __func__, cparams.moe_staging);
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -570,6 +576,9 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                if (cparams.moe_staging > 0) {
+                    ggml_backend_sched_set_moe_staging(sched.get(), cparams.moe_staging);
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
             }
             if (!gf) {
@@ -2901,6 +2910,7 @@ llama_context_params llama_context_default_params() {
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
+        /*.moe_staging                 =*/ 0,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,

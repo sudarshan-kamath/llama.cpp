@@ -361,6 +361,11 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        // MoE expert staging buffer cap (0 = disabled, >0 = max unique experts in GPU staging buffer)
+        // When enabled with --cpu-moe, reduces GPU VRAM by only allocating space for this many experts
+        // instead of all experts. Typically set to n_expert_used (the top-k count).
+        int32_t moe_staging;
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU

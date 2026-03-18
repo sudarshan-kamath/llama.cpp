@@ -1266,30 +1266,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
 
-                        // detect MoE expert weight tensors eligible for staging
-                        bool use_moe_staging = false;
-                        if (sched->moe_staging_cap > 0 &&
-                            j == 0 &&
-                            node->op == GGML_OP_MUL_MAT_ID &&
-                            src->ne[2] > 1 &&
-                            src->buffer != NULL &&
-                            src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-                            use_moe_staging = true;
-                        }
-
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy;
-                            if (use_moe_staging) {
-                                // create staging tensor with ne[2] = moe_staging_cap instead of n_expert
-                                tensor_copy = ggml_new_tensor_3d(sched->ctx, src->type, src->ne[0], src->ne[1], sched->moe_staging_cap);
-                                // preserve original strides for ne[0] and ne[1] (handles quantized types)
-                                tensor_copy->nb[0] = src->nb[0];
-                                tensor_copy->nb[1] = src->nb[1];
-                                tensor_copy->nb[2] = src->nb[2]; // same expert stride as original
-                                tensor_copy->nb[3] = tensor_copy->nb[2] * sched->moe_staging_cap;
-                            } else {
-                                tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                            }
+                            tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
@@ -1515,8 +1494,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    // detect if this copy tensor was created with staging (reduced ne[2])
-                    const bool staging = (sched->moe_staging_cap > 0 && input_cpy->ne[2] < n_expert);
+                    // count unique experts to decide if staging packing is possible
+                    int n_unique = 0;
+                    if (sched->moe_staging_cap > 0) {
+                        for (int64_t eid = 0; eid < n_expert; eid++) {
+                            if (ggml_bitset_get(used_ids.data(), eid)) {
+                                n_unique++;
+                            }
+                        }
+                    }
+                    const bool staging = (sched->moe_staging_cap > 0 && n_unique <= sched->moe_staging_cap);
+
+                    // restore ne[2] to full expert count in case a previous batch mutated it via staging
+                    input_cpy->ne[2] = n_expert;
+                    input_cpy->nb[3] = input_cpy->nb[2] * n_expert;
 
                     ggml_backend_synchronize(input_backend);
 
@@ -1559,13 +1550,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (staging) {
                         // MoE staging mode: pack selected experts contiguously into slots 0..n_unique-1
                         // and remap the ids tensor to use the new slot indices
+                        // The copy tensor is full-size but we pack into the front and set ne[2] = n_unique
+                        // so mul_mat_id only iterates over the packed experts
 
                         // build remap table: absolute expert id -> staging slot
                         std::vector<int32_t> remap(n_expert, -1);
                         int slot = 0;
                         for (int64_t eid = 0; eid < n_expert; eid++) {
                             if (ggml_bitset_get(used_ids.data(), eid)) {
-                                GGML_ASSERT(slot < sched->moe_staging_cap && "unique experts exceed moe_staging_cap");
                                 remap[eid] = slot;
 
                                 // copy this expert to the staging slot
@@ -1573,7 +1565,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 const size_t dst_offset = slot * expert_size;
                                 // add padding for MMQ (same logic as original)
                                 const size_t padding = std::min<size_t>(expert_size, 512);
-                                const bool is_last_slot = (slot == sched->moe_staging_cap - 1);
+                                const bool is_last_slot = (slot == n_unique - 1);
                                 const size_t padding_end = is_last_slot ? 0 : padding;
 
                                 ggml_backend_tensor_set_async(split_backend,
@@ -1585,8 +1577,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
+                        // temporarily set ne[2] to n_unique so mul_mat_id only iterates packed experts
+                        input_cpy->ne[2] = n_unique;
+                        input_cpy->nb[3] = input_cpy->nb[2] * n_unique;
+
                         // remap the ids tensor: replace absolute expert IDs with staging slot indices
-                        // we write remapped ids into a local buffer, then upload to the ids copy on the split backend
                         std::vector<int32_t> remapped_ids(ids.size());
                         for (size_t i = 0; i < ids.size(); i++) {
                             int32_t orig = ids[i];
@@ -1595,8 +1590,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             remapped_ids[i] = remap[orig];
                         }
 
-                        // find the ids tensor copy on the split backend and write remapped ids to it
-                        // ids_tensor_cpy is node->src[2] which should already be the copy on this backend
+                        // write remapped ids to the ids copy on the split backend
                         ggml_backend_tensor_set_async(split_backend,
                             ids_tensor_cpy,
                             remapped_ids.data(), 0,
